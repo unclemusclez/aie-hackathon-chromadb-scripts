@@ -11,19 +11,48 @@ DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # local & fast (sentence-transform
 
 def extract_functions_from_ast_json(data: Any, file_path: str = "") -> List[Dict[str, Any]]:
     """
-    Recursively walk the AST JSON and pull out function/method definitions
-    with all available metadata.
-    Expects a structure similar to what libcst or a custom exporter gives:
-    - node type
-    - name
-    - params
-    - returns (annotation)
-    - body
-    - docstring (usually in body[0] if it's an Expr with Constant string)
-    - leading comments, etc.
+    Extract functions and methods from JSON structure.
+    Handles two formats:
+    1. AST format: nodes with node_type fields (FunctionDef, ClassDef, etc.)
+    2. Code analysis format: top-level dict with file paths, each containing classes/functions arrays
     """
     functions = []
 
+    # Check if this is the code analysis format (file paths as top-level keys)
+    if isinstance(data, dict) and not any(k in data for k in ["node_type", "type"]):
+        # This is the code analysis format - iterate over file paths
+        for file_key, file_data in data.items():
+            if not isinstance(file_data, dict):
+                continue
+            
+            # Use the file key as the file path, or extract from file_data
+            current_file_path = file_data.get("file_path", file_key)
+            
+            # Extract standalone functions
+            file_functions = file_data.get("functions", [])
+            for func in file_functions:
+                if not isinstance(func, dict):
+                    continue
+                functions.append(_build_function_entry(func, current_file_path, is_method=False))
+            
+            # Extract methods from classes
+            classes = file_data.get("classes", [])
+            for cls in classes:
+                if not isinstance(cls, dict):
+                    continue
+                class_name = cls.get("name", "")
+                methods = cls.get("methods", [])
+                for method in methods:
+                    if not isinstance(method, dict):
+                        continue
+                    # Prefix method name with class name
+                    method_copy = method.copy()
+                    method_copy["name"] = f"{class_name}.{method.get('name', 'unknown')}"
+                    functions.append(_build_function_entry(method_copy, current_file_path, is_method=True))
+        
+        return functions
+
+    # Otherwise, try the AST format (original logic)
     def walk(node: Dict[str, Any]):
         if not isinstance(node, dict):
             return
@@ -125,6 +154,129 @@ Leading comments:
     return functions
 
 
+def _build_function_entry(func: Dict[str, Any], file_path: str, is_method: bool = False) -> Dict[str, Any]:
+    """Build a function entry from the code analysis format."""
+    name = func.get("name", "unknown")
+    docstring = func.get("docstring", "") or ""
+    returns = func.get("returns", "")
+    is_async = func.get("is_async", False)
+    arguments = func.get("arguments", [])
+    comment = func.get("comment", "")
+    line = func.get("line", "")
+    end_line = func.get("end_line", "")
+    decorators = func.get("decorators", [])
+    variables = func.get("variables", [])
+    calls = func.get("calls", [])
+    attributes = func.get("attributes", [])
+    
+    # Build argument string
+    arg_list = []
+    for arg in arguments:
+        arg_name = arg.get("name", "")
+        annotation = arg.get("annotation")
+        default = arg.get("default")
+        if annotation:
+            arg_str = f"{arg_name}: {annotation}"
+        else:
+            arg_str = arg_name
+        if default is not None:
+            arg_str += f" = {default}"
+        arg_list.append(arg_str)
+    arg_str = ", ".join(arg_list)
+    
+    # Build decorators string
+    decorators_str = ", ".join(decorators) if decorators else "None"
+    
+    # Build full text representation (for embedding/search)
+    func_type = "async method" if (is_async and is_method) else ("async function" if is_async else ("method" if is_method else "function"))
+    
+    # Format variables as a simple list for document text
+    variables_list = []
+    for var in variables:
+        var_name = var.get("name", "")
+        var_type = var.get("value_type", "")
+        var_preview = var.get("value_preview", "")
+        var_comment = var.get("comment", "")
+        var_entry = var_name
+        if var_type:
+            var_entry += f" ({var_type})"
+        if var_preview:
+            var_entry += f": {var_preview}"
+        if var_comment:
+            var_entry += f" # {var_comment}"
+        variables_list.append(var_entry)
+    variables_text = ", ".join(variables_list) if variables_list else "None"
+    
+    # Format function calls as a simple list
+    calls_list = []
+    for call in calls:
+        func_name = call.get("function", "")
+        line_num = call.get("line", "")
+        args_count = call.get("args_count", 0)
+        keywords = call.get("keywords", [])
+        call_entry = func_name
+        if args_count > 0:
+            call_entry += f"({args_count} args"
+            if keywords:
+                call_entry += f", keywords: {', '.join(keywords)}"
+            call_entry += ")"
+        calls_list.append(call_entry)
+    calls_text = ", ".join(calls_list) if calls_list else "None"
+    
+    # Format attributes as a simple list
+    attrs_list = []
+    for attr in attributes:
+        obj = attr.get("object", "")
+        attr_name = attr.get("attribute", "")
+        attrs_list.append(f"{obj}.{attr_name}")
+    attributes_text = ", ".join(attrs_list) if attrs_list else "None"
+    
+    # Build document text in the format requested
+    comment_display = comment if comment else "None"
+    docstring_display = docstring if docstring else ""
+    returns_display = returns if returns else ""
+    
+    full_text = f"""Function: {name}
+File: {file_path}
+Args: {arg_str}
+Returns: {returns_display}
+Docstring:
+{docstring_display}
+Comment: {comment_display}
+variables: {variables_text}
+function calls: {calls_text}
+attributes: {attributes_text}""".strip()
+    
+    # Build metadata (for filtering/display)
+    metadata = {
+        "name": name,
+        "file": file_path,
+        "type": func_type,
+        "returns": returns or "",
+        "docstring": docstring,
+        "is_async": str(is_async),
+        "is_method": str(is_method),
+        "line": str(line) if line else "",
+        "end_line": str(end_line) if end_line else "",
+        "decorators": json.dumps(decorators),
+        "variables_count": str(len(variables)),
+        "calls_count": str(len(calls)),
+        "attributes_count": str(len(attributes)),
+        "source": "code_analysis_json",
+    }
+    
+    # Add variables, calls, and attributes as JSON strings for detailed access
+    metadata["variables"] = json.dumps(variables)
+    metadata["calls"] = json.dumps(calls)
+    metadata["attributes"] = json.dumps(attributes)
+    
+    return {
+        "id": f"{file_path}::{name}",
+        "document": full_text,
+        "metadata": metadata
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Import AST JSON into ChromaDB")
     parser.add_argument("json_path", help="Path to the exported AST JSON file or directory")
@@ -156,6 +308,8 @@ def main():
         with open(json_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        # For the code analysis format, file_path is extracted inside extract_functions_from_ast_json
+        # For AST format, we need to provide it
         file_path = data.get("file_path", os.path.basename(json_file))
         functions = extract_functions_from_ast_json(data, file_path=file_path)
 

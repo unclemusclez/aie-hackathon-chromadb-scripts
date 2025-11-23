@@ -76,7 +76,7 @@ def import_from_your_json(json_path: str, collection):
             class_name = cls['name']
             for method in cls.get('methods', []):
                 text = build_rich_text_for_method(method, class_name, file_path)
-                method_id = f"{file_path}::{class_name}.{method['name']}"
+                method_id = f"{file_path}:{method['line']}::{class_name}.{method['name']}"
 
                 documents.append(text)
                 metadatas.append({
